@@ -1,12 +1,10 @@
 /**
- * SIMULATORE API FICR v2.0
+ * SIMULATORE API FICR v2.1
  * 
- * Chat 17: Controllo completo da pagina web
- * - Endpoint init/start/pause/stop/reset
- * - Timer automatico per rilascio tempi
- * - Parametri configurabili dal frontend
- * - Log dettagliato con numeri piloti per PS
- * - Logica sovrapposizione PS realistica
+ * Chat 17: Fix sovrapposizione realistica
+ * - Max 2 PS attive contemporaneamente
+ * - Progressione graduale PS per PS
+ * - Log dettagliato con numeri piloti
  */
 
 const express = require('express');
@@ -28,50 +26,35 @@ const pool = new Pool({
 // STATO SIMULAZIONE
 // ============================================
 let statoSimulazione = {
-  // Stato generale
   inizializzato: false,
   inEsecuzione: false,
   inPausa: false,
   completato: false,
-  
-  // Dati evento
   eventoId: null,
   evento: null,
-  
-  // Tempi
   tempiPerPilota: {},
   tempiOriginali: [],
   tempiTotali: 0,
   tempiRilasciati: 0,
-  
-  // PS
   psOrdinate: [],
   proveInfo: {},
   tempiRilasciatiPerPS: {},
   tempiTotaliPerPS: {},
-  
-  // Piloti
   pilotiOrdine: [],
   psRilasciatePerPilota: {},
   numPiloti: 0,
-  
-  // Parametri (configurabili da frontend)
   parametri: {
     durataMinuti: 5,
     batchMin: 30,
     batchMax: 50,
     sovrapposizione: 0.7
   },
-  
-  // Timer
   timerRef: null,
   intervalloMs: 5000,
-  
-  // Timestamp
   oraInizio: null,
-  
-  // Log eventi (ultimi 50)
-  logEventi: []
+  logEventi: [],
+  // NUOVO: traccia la PS corrente principale
+  psCorrenteIndex: 0
 };
 
 // ============================================
@@ -116,14 +99,12 @@ function aggiungiLog(icona, tipo, messaggio, dettaglio = null) {
 async function inizializzaSimulazione(eventoId, parametri = {}) {
   console.log(`\n📊 Inizializzazione simulazione per evento: ${eventoId}`);
   
-  // Ferma eventuale simulazione in corso
   if (statoSimulazione.timerRef) {
     clearInterval(statoSimulazione.timerRef);
     statoSimulazione.timerRef = null;
   }
   
   try {
-    // Verifica evento
     const eventoResult = await pool.query(
       'SELECT * FROM eventi WHERE id = $1',
       [eventoId]
@@ -133,7 +114,6 @@ async function inizializzaSimulazione(eventoId, parametri = {}) {
       throw new Error(`Evento non trovato: ${eventoId}`);
     }
     
-    // Carica tutti i tempi
     const tempiResult = await pool.query(`
       SELECT 
         t.id,
@@ -159,7 +139,6 @@ async function inizializzaSimulazione(eventoId, parametri = {}) {
       throw new Error('Nessun tempo trovato. Importare prima i tempi da FICR.');
     }
     
-    // Aggiorna parametri
     const params = {
       durataMinuti: parametri.durata_minuti || parametri.durataMinuti || 5,
       batchMin: parametri.batch_min || parametri.batchMin || 30,
@@ -167,11 +146,7 @@ async function inizializzaSimulazione(eventoId, parametri = {}) {
       sovrapposizione: parametri.sovrapposizione || 0.7
     };
     
-    // Calcola intervallo per rispettare la durata
-    const numBatch = Math.ceil(tempiResult.rows.length / ((params.batchMin + params.batchMax) / 2));
-    const intervalloMs = Math.floor((params.durataMinuti * 60 * 1000) / numBatch);
-    
-    // Raggruppa tempi per pilota
+    // Calcola intervallo: vogliamo che ogni PS duri circa (durata / numPS)
     const tempiPerPilota = {};
     const psSet = new Set();
     
@@ -187,7 +162,12 @@ async function inizializzaSimulazione(eventoId, parametri = {}) {
     const psOrdinate = Array.from(psSet).sort((a, b) => a - b);
     const piloti = Object.keys(tempiPerPilota).map(Number).sort((a, b) => a - b);
     
-    // Info prove
+    // Calcolo intervallo: durata totale / numero batch stimati
+    // Ogni PS ha ~186 tempi, con batch di 40 servono ~5 batch per PS
+    // Con 7 PS servono ~35 batch totali
+    const numBatch = Math.ceil(tempiResult.rows.length / ((params.batchMin + params.batchMax) / 2));
+    const intervalloMs = Math.floor((params.durataMinuti * 60 * 1000) / numBatch);
+    
     const proveInfo = {};
     const tempiTotaliPerPS = {};
     const tempiRilasciatiPerPS = {};
@@ -199,13 +179,11 @@ async function inizializzaSimulazione(eventoId, parametri = {}) {
       tempiRilasciatiPerPS[ps] = 0;
     });
     
-    // Inizializza stato rilascio piloti
     const psRilasciatePerPilota = {};
     piloti.forEach(p => {
       psRilasciatePerPilota[p] = -1;
     });
     
-    // Aggiorna stato globale
     statoSimulazione = {
       ...statoSimulazione,
       inizializzato: true,
@@ -229,19 +207,14 @@ async function inizializzaSimulazione(eventoId, parametri = {}) {
       intervalloMs: Math.max(1000, intervalloMs),
       timerRef: null,
       oraInizio: null,
-      logEventi: []
+      logEventi: [],
+      psCorrenteIndex: 0
     };
     
     aggiungiLog('✅', 'INIT', `Evento: ${statoSimulazione.evento.nome_evento}`);
     aggiungiLog('📊', 'INFO', `${tempiResult.rows.length} tempi, ${piloti.length} piloti, ${psOrdinate.length} PS`);
     aggiungiLog('⚙️', 'CONFIG', `Durata ${params.durataMinuti}min, Batch ${params.batchMin}-${params.batchMax}, Sovr ${Math.round(params.sovrapposizione * 100)}%`);
     aggiungiLog('⏱️', 'TIMER', `Intervallo rilascio: ${Math.round(statoSimulazione.intervalloMs / 1000)}s`);
-    
-    console.log(`\n✅ Simulazione inizializzata!`);
-    console.log(`   Tempi: ${tempiResult.rows.length}`);
-    console.log(`   Piloti: ${piloti.length}`);
-    console.log(`   PS: ${psOrdinate.join(', ')}`);
-    console.log(`   Intervallo: ${Math.round(statoSimulazione.intervalloMs / 1000)}s`);
     
     return {
       success: true,
@@ -260,7 +233,7 @@ async function inizializzaSimulazione(eventoId, parametri = {}) {
 }
 
 // ============================================
-// RILASCIO TEMPI (con sovrapposizione)
+// RILASCIO TEMPI - LOGICA CORRETTA
 // ============================================
 
 function rilasciaBatch() {
@@ -269,7 +242,6 @@ function rilasciaBatch() {
   }
   
   if (statoSimulazione.tempiRilasciati >= statoSimulazione.tempiTotali) {
-    // Completato
     if (statoSimulazione.timerRef) {
       clearInterval(statoSimulazione.timerRef);
       statoSimulazione.timerRef = null;
@@ -284,89 +256,124 @@ function rilasciaBatch() {
   const batchSize = Math.floor(Math.random() * (batchMax - batchMin + 1)) + batchMin;
   const psOrdinate = statoSimulazione.psOrdinate;
   
-  // Trova PS attive
-  const psAttive = psOrdinate.filter(ps => {
-    const rilasciati = statoSimulazione.tempiRilasciatiPerPS[ps] || 0;
-    const totali = statoSimulazione.tempiTotaliPerPS[ps] || 1;
-    return rilasciati < totali;
-  });
+  // NUOVA LOGICA: Lavora solo sulla PS corrente e (eventualmente) la successiva
+  const psCorrenteNumero = psOrdinate[statoSimulazione.psCorrenteIndex];
+  const psSuccessivaNumero = psOrdinate[statoSimulazione.psCorrenteIndex + 1];
   
-  if (psAttive.length === 0) {
+  if (!psCorrenteNumero && !psSuccessivaNumero) {
     statoSimulazione.completato = true;
     return { completato: true, tempi: [] };
   }
   
-  // Calcola quali PS possono rilasciare
-  const psConPercentuale = psAttive.map(ps => ({
-    ps,
-    rilasciati: statoSimulazione.tempiRilasciatiPerPS[ps] || 0,
-    totali: statoSimulazione.tempiTotaliPerPS[ps] || 1,
-    percentuale: (statoSimulazione.tempiRilasciatiPerPS[ps] || 0) / (statoSimulazione.tempiTotaliPerPS[ps] || 1)
-  }));
+  // Calcola percentuale PS corrente
+  const percentualeCorrente = psCorrenteNumero 
+    ? (statoSimulazione.tempiRilasciatiPerPS[psCorrenteNumero] || 0) / (statoSimulazione.tempiTotaliPerPS[psCorrenteNumero] || 1)
+    : 1;
   
-  const psChePossonoRilasciare = [];
-  for (let i = 0; i < psConPercentuale.length; i++) {
-    const ps = psConPercentuale[i];
-    if (i === 0) {
-      psChePossonoRilasciare.push(ps);
-    } else {
-      const psPrecedente = psConPercentuale[i - 1];
-      if (psPrecedente.percentuale >= sovrapposizione) {
-        psChePossonoRilasciare.push(ps);
-      }
-    }
+  // Se PS corrente è completa, passa alla successiva
+  if (percentualeCorrente >= 1 && psSuccessivaNumero) {
+    statoSimulazione.psCorrenteIndex++;
+    aggiungiLog('➡️', 'AVANZA', `Passaggio a PS${psOrdinate[statoSimulazione.psCorrenteIndex]}`);
   }
   
-  // Rilascia tempi
   const batch = [];
   const pilotiPerPS = {};
   let tempiRimanenti = batchSize;
   
-  for (let i = 0; i < psChePossonoRilasciare.length && tempiRimanenti > 0; i++) {
-    const psInfo = psChePossonoRilasciare[i];
-    const ps = psInfo.ps;
-    const psIndex = psOrdinate.indexOf(ps);
+  // PS principale (corrente)
+  const psMainIndex = statoSimulazione.psCorrenteIndex;
+  const psMain = psOrdinate[psMainIndex];
+  
+  if (psMain) {
+    const percMain = (statoSimulazione.tempiRilasciatiPerPS[psMain] || 0) / (statoSimulazione.tempiTotaliPerPS[psMain] || 1);
     
-    const tempiPerQuestaPS = i === 0 
-      ? Math.ceil(tempiRimanenti * 0.7) 
-      : Math.ceil(tempiRimanenti / (psChePossonoRilasciare.length - i));
+    // Calcola quanti tempi assegnare a PS principale
+    // Se non c'è sovrapposizione con la successiva, tutti i tempi vanno qui
+    const puoSovrapporre = percMain >= sovrapposizione && psOrdinate[psMainIndex + 1];
     
-    const pilotiDisponibili = statoSimulazione.pilotiOrdine.filter(numGara => {
+    let tempiPerMain;
+    if (puoSovrapporre) {
+      // 70% alla principale, 30% alla successiva
+      tempiPerMain = Math.ceil(tempiRimanenti * 0.7);
+    } else {
+      // Tutti alla principale
+      tempiPerMain = tempiRimanenti;
+    }
+    
+    // Trova piloti disponibili per PS principale
+    const pilotiDisponibiliMain = statoSimulazione.pilotiOrdine.filter(numGara => {
       const tempiPilota = statoSimulazione.tempiPerPilota[numGara];
-      const ultimaPsRilasciata = statoSimulazione.psRilasciatePerPilota[numGara];
-      return tempiPilota && tempiPilota[psIndex] && psIndex === ultimaPsRilasciata + 1;
+      const ultimaPs = statoSimulazione.psRilasciatePerPilota[numGara];
+      return tempiPilota && tempiPilota[psMainIndex] && psMainIndex === ultimaPs + 1;
     });
     
-    const pilotiDaRilasciare = pilotiDisponibili.slice(0, tempiPerQuestaPS);
-    pilotiPerPS[ps] = [];
+    pilotiPerPS[psMain] = [];
+    const pilotiDaRilasciareMain = pilotiDisponibiliMain.slice(0, tempiPerMain);
     
-    for (const numGara of pilotiDaRilasciare) {
+    for (const numGara of pilotiDaRilasciareMain) {
       const tempiPilota = statoSimulazione.tempiPerPilota[numGara];
-      const tempo = tempiPilota[psIndex];
+      const tempo = tempiPilota[psMainIndex];
       
       if (tempo) {
         batch.push(tempo);
-        pilotiPerPS[ps].push(numGara);
-        statoSimulazione.psRilasciatePerPilota[numGara] = psIndex;
-        statoSimulazione.tempiRilasciatiPerPS[ps]++;
+        pilotiPerPS[psMain].push(numGara);
+        statoSimulazione.psRilasciatePerPilota[numGara] = psMainIndex;
+        statoSimulazione.tempiRilasciatiPerPS[psMain]++;
         statoSimulazione.tempiRilasciati++;
         tempiRimanenti--;
+      }
+    }
+    
+    // Se può sovrapporre, rilascia anche per PS successiva
+    if (puoSovrapporre && tempiRimanenti > 0) {
+      const psNext = psOrdinate[psMainIndex + 1];
+      const psNextIndex = psMainIndex + 1;
+      
+      const pilotiDisponibiliNext = statoSimulazione.pilotiOrdine.filter(numGara => {
+        const tempiPilota = statoSimulazione.tempiPerPilota[numGara];
+        const ultimaPs = statoSimulazione.psRilasciatePerPilota[numGara];
+        return tempiPilota && tempiPilota[psNextIndex] && psNextIndex === ultimaPs + 1;
+      });
+      
+      pilotiPerPS[psNext] = [];
+      const pilotiDaRilasciareNext = pilotiDisponibiliNext.slice(0, tempiRimanenti);
+      
+      for (const numGara of pilotiDaRilasciareNext) {
+        const tempiPilota = statoSimulazione.tempiPerPilota[numGara];
+        const tempo = tempiPilota[psNextIndex];
+        
+        if (tempo) {
+          batch.push(tempo);
+          pilotiPerPS[psNext].push(numGara);
+          statoSimulazione.psRilasciatePerPilota[numGara] = psNextIndex;
+          statoSimulazione.tempiRilasciatiPerPS[psNext]++;
+          statoSimulazione.tempiRilasciati++;
+          tempiRimanenti--;
+        }
       }
     }
   }
   
   // Log dettagliato
-  const psLive = psChePossonoRilasciare.map(p => `PS${p.ps}(${Math.round(p.percentuale * 100)}%)`);
   const dettaglio = Object.entries(pilotiPerPS)
     .filter(([_, piloti]) => piloti.length > 0)
-    .map(([ps, piloti]) => `PS${ps}: ${piloti.join(',')}`)
+    .map(([ps, piloti]) => `PS${ps}: ${piloti.slice(0, 5).join(',')}${piloti.length > 5 ? '...' : ''} (${piloti.length})`)
     .join(' | ');
   
   const progresso = Math.round((statoSimulazione.tempiRilasciati / statoSimulazione.tempiTotali) * 100);
-  aggiungiLog('📤', 'BATCH', `${batch.length} tempi (${progresso}%)`, dettaglio);
   
-  if (psLive.length > 1) {
-    aggiungiLog('🔴', 'PS LIVE', psLive.join(', '));
+  // Mostra PS attive
+  const psAttiveLog = [];
+  psOrdinate.forEach(ps => {
+    const perc = Math.round((statoSimulazione.tempiRilasciatiPerPS[ps] || 0) / (statoSimulazione.tempiTotaliPerPS[ps] || 1) * 100);
+    if (perc > 0 && perc < 100) {
+      psAttiveLog.push(`PS${ps}:${perc}%`);
+    }
+  });
+  
+  aggiungiLog('📤', 'BATCH', `${batch.length} tempi (${progresso}%)`, dettaglio);
+  if (psAttiveLog.length > 0) {
+    aggiungiLog('🔴', 'LIVE', psAttiveLog.join(', '));
   }
   
   return {
@@ -375,7 +382,6 @@ function rilasciaBatch() {
     rilasciati: statoSimulazione.tempiRilasciati,
     totali: statoSimulazione.tempiTotali,
     progresso,
-    psLive: psChePossonoRilasciare.map(p => ({ ps: p.ps, percentuale: Math.round(p.percentuale * 100) })),
     pilotiPerPS
   };
 }
@@ -392,21 +398,18 @@ async function salvaTempiDB(tempi) {
   
   for (const tempo of tempi) {
     try {
-      // Verifica se esiste già
       const exists = await pool.query(
         'SELECT id FROM tempi WHERE id_pilota = $1 AND id_ps = $2',
         [tempo.id_pilota, tempo.id_ps]
       );
       
       if (exists.rows.length === 0) {
-        // Inserisci
         await pool.query(`
           INSERT INTO tempi (id_pilota, id_ps, tempo_secondi, penalita_secondi)
           VALUES ($1, $2, $3, $4)
         `, [tempo.id_pilota, tempo.id_ps, tempo.tempo_secondi, tempo.penalita_secondi || 0]);
         salvati++;
       } else {
-        // Già esistente, conta come salvato
         salvati++;
       }
     } catch (err) {
@@ -426,7 +429,6 @@ async function salvaTempiDB(tempi) {
 // ENDPOINTS API
 // ============================================
 
-// Inizializza simulazione con parametri
 app.post('/simulator/init', async (req, res) => {
   const { evento_id, durata_minuti, batch_min, batch_max, sovrapposizione } = req.body;
   
@@ -444,10 +446,9 @@ app.post('/simulator/init', async (req, res) => {
   res.json(result);
 });
 
-// Avvia simulazione automatica
 app.post('/simulator/start', async (req, res) => {
   if (!statoSimulazione.inizializzato) {
-    return res.status(400).json({ success: false, error: 'Simulazione non inizializzata. Chiamare /simulator/init' });
+    return res.status(400).json({ success: false, error: 'Simulazione non inizializzata' });
   }
   
   if (statoSimulazione.inEsecuzione && !statoSimulazione.inPausa) {
@@ -458,7 +459,6 @@ app.post('/simulator/start', async (req, res) => {
   statoSimulazione.inPausa = false;
   statoSimulazione.oraInizio = statoSimulazione.oraInizio || new Date();
   
-  // Avvia timer
   if (!statoSimulazione.timerRef) {
     statoSimulazione.timerRef = setInterval(async () => {
       if (!statoSimulazione.inPausa) {
@@ -479,7 +479,6 @@ app.post('/simulator/start', async (req, res) => {
   });
 });
 
-// Pausa/Riprendi
 app.post('/simulator/pause', (req, res) => {
   if (!statoSimulazione.inEsecuzione) {
     return res.status(400).json({ success: false, error: 'Simulazione non in esecuzione' });
@@ -500,7 +499,6 @@ app.post('/simulator/pause', (req, res) => {
   });
 });
 
-// Stop simulazione
 app.post('/simulator/stop', (req, res) => {
   if (statoSimulazione.timerRef) {
     clearInterval(statoSimulazione.timerRef);
@@ -520,7 +518,6 @@ app.post('/simulator/stop', (req, res) => {
   });
 });
 
-// Reset simulazione
 app.post('/simulator/reset', async (req, res) => {
   const eventoId = req.body.evento_id || statoSimulazione.eventoId || config.EVENTO_DEFAULT;
   
@@ -538,7 +535,6 @@ app.post('/simulator/reset', async (req, res) => {
   res.json(result);
 });
 
-// Status dettagliato
 app.get('/simulator/status', (req, res) => {
   if (!statoSimulazione.inizializzato) {
     return res.json({ 
@@ -549,7 +545,6 @@ app.get('/simulator/status', (req, res) => {
   
   const progresso = Math.round((statoSimulazione.tempiRilasciati / statoSimulazione.tempiTotali) * 100);
   
-  // Calcola PS live
   const psLive = statoSimulazione.psOrdinate
     .map(ps => ({
       ps,
@@ -570,72 +565,31 @@ app.get('/simulator/status', (req, res) => {
     piloti: statoSimulazione.numPiloti,
     prove: statoSimulazione.psOrdinate.length,
     psLive,
+    psCorrente: statoSimulazione.psOrdinate[statoSimulazione.psCorrenteIndex],
     parametri: statoSimulazione.parametri,
     intervalloMs: statoSimulazione.intervalloMs,
     oraInizio: statoSimulazione.oraInizio
   });
 });
 
-// Log eventi
 app.get('/simulator/log', (req, res) => {
-  res.json({
-    log: statoSimulazione.logEventi
-  });
+  res.json({ log: statoSimulazione.logEventi });
 });
 
-// Endpoint FICR simulato (per compatibilità con polling esistente)
-app.get('/END/mpcache-5/get/clasps/:anno/:equipe/:manif/:giorno/:prova/*', (req, res) => {
-  const { anno, equipe, manif, giorno, prova } = req.params;
-  
-  if (!statoSimulazione.inizializzato) {
-    return res.json({ data: { clasdella: [] } });
-  }
-  
-  // Se in esecuzione automatica, restituisce batch vuoto
-  // (i tempi vengono rilasciati dal timer interno)
-  if (statoSimulazione.inEsecuzione) {
-    return res.json({ data: { clasdella: [] } });
-  }
-  
-  // Altrimenti rilascia un batch manualmente
-  const result = rilasciaBatch();
-  
-  if (!result || !result.tempi) {
-    return res.json({ data: { clasdella: [] } });
-  }
-  
-  const clasdella = result.tempi.map(t => ({
-    Numero: t.numero_gara,
-    Tempo: formatTempoFICR(t.tempo_secondi),
-    Cognome: t.cognome,
-    Nome: t.nome,
-    Classe: t.classe || '',
-    Moto: t.moto || '',
-    Motoclub: '',
-    Naz: 'ITA',
-    Penalita: t.penalita_secondi || 0,
-    NumeroProva: t.numero_ordine
-  }));
-  
-  res.json({ data: { clasdella } });
-});
-
-// Health check
 app.get('/health', (req, res) => {
   res.json({ 
     status: 'OK', 
     service: 'ficr-simulator',
-    version: '2.0.0',
+    version: '2.1.0',
     timestamp: new Date().toISOString() 
   });
 });
 
-// Info
 app.get('/', (req, res) => {
   res.json({
     name: 'FICR Simulator',
-    version: '2.0.0',
-    description: 'Chat 17: Controllo completo da pagina web',
+    version: '2.1.0',
+    description: 'Fix sovrapposizione realistica - max 2 PS attive',
     endpoints: {
       'POST /simulator/init': 'Inizializza con evento_id e parametri',
       'POST /simulator/start': 'Avvia rilascio automatico',
@@ -643,8 +597,7 @@ app.get('/', (req, res) => {
       'POST /simulator/stop': 'Ferma simulazione',
       'POST /simulator/reset': 'Reset simulazione',
       'GET /simulator/status': 'Stato dettagliato',
-      'GET /simulator/log': 'Log eventi',
-      'GET /health': 'Health check'
+      'GET /simulator/log': 'Log eventi'
     }
   });
 });
@@ -663,16 +616,9 @@ async function avviaServer() {
   }
   
   app.listen(config.PORT, () => {
-    console.log(`\n🚀 Simulatore FICR v2.0 avviato su porta ${config.PORT}`);
+    console.log(`\n🚀 Simulatore FICR v2.1 avviato su porta ${config.PORT}`);
     console.log(`   http://localhost:${config.PORT}`);
-    console.log(`\n📋 Nuovi Endpoints:`);
-    console.log(`   POST /simulator/init   - Inizializza`);
-    console.log(`   POST /simulator/start  - Avvia`);
-    console.log(`   POST /simulator/pause  - Pausa/Riprendi`);
-    console.log(`   POST /simulator/stop   - Ferma`);
-    console.log(`   POST /simulator/reset  - Reset`);
-    console.log(`   GET  /simulator/status - Stato`);
-    console.log(`   GET  /simulator/log    - Log eventi\n`);
+    console.log(`\n📋 Fix: Max 2 PS attive contemporaneamente\n`);
   });
 }
 
