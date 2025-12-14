@@ -1,10 +1,10 @@
 /**
- * SIMULATORE API FICR v2.1
+ * SIMULATORE API FICR v2.2
  * 
- * Chat 17: Fix sovrapposizione realistica
+ * Chat 17: Fix completo
+ * - Reset cancella tempi dal DB
  * - Max 2 PS attive contemporaneamente
- * - Progressione graduale PS per PS
- * - Log dettagliato con numeri piloti
+ * - Progressione graduale
  */
 
 const express = require('express');
@@ -16,7 +16,6 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// Connessione DB
 const pool = new Pool({
   connectionString: config.DATABASE_URL,
   ssl: { rejectUnauthorized: false }
@@ -33,7 +32,7 @@ let statoSimulazione = {
   eventoId: null,
   evento: null,
   tempiPerPilota: {},
-  tempiOriginali: [],
+  tempiInMemoria: [],
   tempiTotali: 0,
   tempiRilasciati: 0,
   psOrdinate: [],
@@ -53,30 +52,12 @@ let statoSimulazione = {
   intervalloMs: 5000,
   oraInizio: null,
   logEventi: [],
-  // NUOVO: traccia la PS corrente principale
   psCorrenteIndex: 0
 };
 
 // ============================================
 // FUNZIONI UTILITÀ
 // ============================================
-
-function formatTempoFICR(secondi) {
-  if (!secondi) return null;
-  const min = Math.floor(secondi / 60);
-  const sec = (secondi % 60).toFixed(2);
-  return `${min}'${sec.padStart(5, '0')}`;
-}
-
-function shuffleConVariazione(array, maxVar) {
-  return array
-    .map((item, index) => ({
-      item,
-      sortKey: index + (Math.random() * maxVar * 2 - maxVar)
-    }))
-    .sort((a, b) => a.sortKey - b.sortKey)
-    .map(({ item }) => item);
-}
 
 function aggiungiLog(icona, tipo, messaggio, dettaglio = null) {
   const log = {
@@ -92,8 +73,51 @@ function aggiungiLog(icona, tipo, messaggio, dettaglio = null) {
   return log;
 }
 
+function shuffleConVariazione(array, maxVar) {
+  return array
+    .map((item, index) => ({
+      item,
+      sortKey: index + (Math.random() * maxVar * 2 - maxVar)
+    }))
+    .sort((a, b) => a.sortKey - b.sortKey)
+    .map(({ item }) => item);
+}
+
 // ============================================
-// INIZIALIZZAZIONE
+// CANCELLA TEMPI DAL DATABASE
+// ============================================
+
+async function cancellaTempiEvento(eventoId) {
+  try {
+    // Trova tutti i piloti dell'evento
+    const pilotiResult = await pool.query(
+      'SELECT id FROM piloti WHERE id_evento = $1',
+      [eventoId]
+    );
+    
+    if (pilotiResult.rows.length === 0) {
+      return { cancellati: 0 };
+    }
+    
+    const pilotiIds = pilotiResult.rows.map(p => p.id);
+    
+    // Cancella i tempi di questi piloti
+    const deleteResult = await pool.query(
+      'DELETE FROM tempi WHERE id_pilota = ANY($1)',
+      [pilotiIds]
+    );
+    
+    console.log(`🗑️ Cancellati ${deleteResult.rowCount} tempi dal database`);
+    return { cancellati: deleteResult.rowCount };
+    
+  } catch (error) {
+    console.error('Errore cancellazione tempi:', error.message);
+    return { cancellati: 0, errore: error.message };
+  }
+}
+
+// ============================================
+// INIZIALIZZAZIONE (carica tempi in memoria)
 // ============================================
 
 async function inizializzaSimulazione(eventoId, parametri = {}) {
@@ -105,6 +129,7 @@ async function inizializzaSimulazione(eventoId, parametri = {}) {
   }
   
   try {
+    // Verifica evento
     const eventoResult = await pool.query(
       'SELECT * FROM eventi WHERE id = $1',
       [eventoId]
@@ -114,6 +139,8 @@ async function inizializzaSimulazione(eventoId, parametri = {}) {
       throw new Error(`Evento non trovato: ${eventoId}`);
     }
     
+    // Carica tempi da FICR (tabella temporanea o calcolo)
+    // Per ora usiamo i tempi già presenti nel DB, ma li salviamo in memoria
     const tempiResult = await pool.query(`
       SELECT 
         t.id,
@@ -139,6 +166,9 @@ async function inizializzaSimulazione(eventoId, parametri = {}) {
       throw new Error('Nessun tempo trovato. Importare prima i tempi da FICR.');
     }
     
+    // Salva tempi in memoria
+    const tempiInMemoria = tempiResult.rows.map(t => ({...t}));
+    
     const params = {
       durataMinuti: parametri.durata_minuti || parametri.durataMinuti || 5,
       batchMin: parametri.batch_min || parametri.batchMin || 30,
@@ -146,11 +176,11 @@ async function inizializzaSimulazione(eventoId, parametri = {}) {
       sovrapposizione: parametri.sovrapposizione || 0.7
     };
     
-    // Calcola intervallo: vogliamo che ogni PS duri circa (durata / numPS)
+    // Raggruppa per pilota
     const tempiPerPilota = {};
     const psSet = new Set();
     
-    tempiResult.rows.forEach(t => {
+    tempiInMemoria.forEach(t => {
       const numGara = t.numero_gara;
       if (!tempiPerPilota[numGara]) {
         tempiPerPilota[numGara] = [];
@@ -162,28 +192,29 @@ async function inizializzaSimulazione(eventoId, parametri = {}) {
     const psOrdinate = Array.from(psSet).sort((a, b) => a - b);
     const piloti = Object.keys(tempiPerPilota).map(Number).sort((a, b) => a - b);
     
-    // Calcolo intervallo: durata totale / numero batch stimati
-    // Ogni PS ha ~186 tempi, con batch di 40 servono ~5 batch per PS
-    // Con 7 PS servono ~35 batch totali
-    const numBatch = Math.ceil(tempiResult.rows.length / ((params.batchMin + params.batchMax) / 2));
+    // Calcola intervallo
+    const numBatch = Math.ceil(tempiInMemoria.length / ((params.batchMin + params.batchMax) / 2));
     const intervalloMs = Math.floor((params.durataMinuti * 60 * 1000) / numBatch);
     
+    // Info prove
     const proveInfo = {};
     const tempiTotaliPerPS = {};
     const tempiRilasciatiPerPS = {};
     
     psOrdinate.forEach(ps => {
-      const tempiPS = tempiResult.rows.filter(t => t.numero_ordine === ps);
+      const tempiPS = tempiInMemoria.filter(t => t.numero_ordine === ps);
       proveInfo[ps] = { totale: tempiPS.length, nome: `PS${ps}` };
       tempiTotaliPerPS[ps] = tempiPS.length;
       tempiRilasciatiPerPS[ps] = 0;
     });
     
+    // Stato rilascio piloti
     const psRilasciatePerPilota = {};
     piloti.forEach(p => {
       psRilasciatePerPilota[p] = -1;
     });
     
+    // Aggiorna stato
     statoSimulazione = {
       ...statoSimulazione,
       inizializzato: true,
@@ -193,8 +224,8 @@ async function inizializzaSimulazione(eventoId, parametri = {}) {
       eventoId,
       evento: eventoResult.rows[0],
       tempiPerPilota,
-      tempiOriginali: tempiResult.rows,
-      tempiTotali: tempiResult.rows.length,
+      tempiInMemoria,
+      tempiTotali: tempiInMemoria.length,
       tempiRilasciati: 0,
       psOrdinate,
       proveInfo,
@@ -212,9 +243,8 @@ async function inizializzaSimulazione(eventoId, parametri = {}) {
     };
     
     aggiungiLog('✅', 'INIT', `Evento: ${statoSimulazione.evento.nome_evento}`);
-    aggiungiLog('📊', 'INFO', `${tempiResult.rows.length} tempi, ${piloti.length} piloti, ${psOrdinate.length} PS`);
+    aggiungiLog('📊', 'INFO', `${tempiInMemoria.length} tempi in memoria, ${piloti.length} piloti, ${psOrdinate.length} PS`);
     aggiungiLog('⚙️', 'CONFIG', `Durata ${params.durataMinuti}min, Batch ${params.batchMin}-${params.batchMax}, Sovr ${Math.round(params.sovrapposizione * 100)}%`);
-    aggiungiLog('⏱️', 'TIMER', `Intervallo rilascio: ${Math.round(statoSimulazione.intervalloMs / 1000)}s`);
     
     return {
       success: true,
@@ -226,14 +256,14 @@ async function inizializzaSimulazione(eventoId, parametri = {}) {
     };
     
   } catch (error) {
-    console.error('❌ Errore inizializzazione:', error.message);
+    console.error('❌ Errore:', error.message);
     aggiungiLog('❌', 'ERRORE', error.message);
     return { success: false, error: error.message };
   }
 }
 
 // ============================================
-// RILASCIO TEMPI - LOGICA CORRETTA
+// RILASCIO BATCH (max 2 PS attive)
 // ============================================
 
 function rilasciaBatch() {
@@ -256,125 +286,99 @@ function rilasciaBatch() {
   const batchSize = Math.floor(Math.random() * (batchMax - batchMin + 1)) + batchMin;
   const psOrdinate = statoSimulazione.psOrdinate;
   
-  // NUOVA LOGICA: Lavora solo sulla PS corrente e (eventualmente) la successiva
-  const psCorrenteNumero = psOrdinate[statoSimulazione.psCorrenteIndex];
-  const psSuccessivaNumero = psOrdinate[statoSimulazione.psCorrenteIndex + 1];
+  // PS corrente
+  const psMainIndex = statoSimulazione.psCorrenteIndex;
+  const psMain = psOrdinate[psMainIndex];
   
-  if (!psCorrenteNumero && !psSuccessivaNumero) {
+  if (!psMain) {
     statoSimulazione.completato = true;
     return { completato: true, tempi: [] };
   }
   
-  // Calcola percentuale PS corrente
-  const percentualeCorrente = psCorrenteNumero 
-    ? (statoSimulazione.tempiRilasciatiPerPS[psCorrenteNumero] || 0) / (statoSimulazione.tempiTotaliPerPS[psCorrenteNumero] || 1)
-    : 1;
+  // Percentuale PS corrente
+  const percMain = (statoSimulazione.tempiRilasciatiPerPS[psMain] || 0) / (statoSimulazione.tempiTotaliPerPS[psMain] || 1);
   
-  // Se PS corrente è completa, passa alla successiva
-  if (percentualeCorrente >= 1 && psSuccessivaNumero) {
+  // Se PS corrente completa, avanza
+  if (percMain >= 1) {
     statoSimulazione.psCorrenteIndex++;
-    aggiungiLog('➡️', 'AVANZA', `Passaggio a PS${psOrdinate[statoSimulazione.psCorrenteIndex]}`);
+    const nuovaPS = psOrdinate[statoSimulazione.psCorrenteIndex];
+    if (nuovaPS) {
+      aggiungiLog('➡️', 'AVANZA', `Passaggio a PS${nuovaPS}`);
+    }
+    return rilasciaBatch(); // Richiama per processare nuova PS
   }
   
   const batch = [];
   const pilotiPerPS = {};
   let tempiRimanenti = batchSize;
   
-  // PS principale (corrente)
-  const psMainIndex = statoSimulazione.psCorrenteIndex;
-  const psMain = psOrdinate[psMainIndex];
+  // Può sovrapporre con PS successiva?
+  const puoSovrapporre = percMain >= sovrapposizione && psOrdinate[psMainIndex + 1];
   
-  if (psMain) {
-    const percMain = (statoSimulazione.tempiRilasciatiPerPS[psMain] || 0) / (statoSimulazione.tempiTotaliPerPS[psMain] || 1);
+  // Tempi per PS principale
+  let tempiPerMain = puoSovrapporre ? Math.ceil(tempiRimanenti * 0.7) : tempiRimanenti;
+  
+  // Trova piloti disponibili per PS principale
+  const pilotiDisponibiliMain = statoSimulazione.pilotiOrdine.filter(numGara => {
+    const tempiPilota = statoSimulazione.tempiPerPilota[numGara];
+    const ultimaPs = statoSimulazione.psRilasciatePerPilota[numGara];
+    return tempiPilota && tempiPilota[psMainIndex] && psMainIndex === ultimaPs + 1;
+  });
+  
+  pilotiPerPS[psMain] = [];
+  const pilotiDaRilasciareMain = pilotiDisponibiliMain.slice(0, tempiPerMain);
+  
+  for (const numGara of pilotiDaRilasciareMain) {
+    const tempiPilota = statoSimulazione.tempiPerPilota[numGara];
+    const tempo = tempiPilota[psMainIndex];
     
-    // Calcola quanti tempi assegnare a PS principale
-    // Se non c'è sovrapposizione con la successiva, tutti i tempi vanno qui
-    const puoSovrapporre = percMain >= sovrapposizione && psOrdinate[psMainIndex + 1];
-    
-    let tempiPerMain;
-    if (puoSovrapporre) {
-      // 70% alla principale, 30% alla successiva
-      tempiPerMain = Math.ceil(tempiRimanenti * 0.7);
-    } else {
-      // Tutti alla principale
-      tempiPerMain = tempiRimanenti;
+    if (tempo) {
+      batch.push(tempo);
+      pilotiPerPS[psMain].push(numGara);
+      statoSimulazione.psRilasciatePerPilota[numGara] = psMainIndex;
+      statoSimulazione.tempiRilasciatiPerPS[psMain]++;
+      statoSimulazione.tempiRilasciati++;
+      tempiRimanenti--;
     }
+  }
+  
+  // Sovrapposizione con PS successiva
+  if (puoSovrapporre && tempiRimanenti > 0) {
+    const psNext = psOrdinate[psMainIndex + 1];
+    const psNextIndex = psMainIndex + 1;
     
-    // Trova piloti disponibili per PS principale
-    const pilotiDisponibiliMain = statoSimulazione.pilotiOrdine.filter(numGara => {
+    const pilotiDisponibiliNext = statoSimulazione.pilotiOrdine.filter(numGara => {
       const tempiPilota = statoSimulazione.tempiPerPilota[numGara];
       const ultimaPs = statoSimulazione.psRilasciatePerPilota[numGara];
-      return tempiPilota && tempiPilota[psMainIndex] && psMainIndex === ultimaPs + 1;
+      return tempiPilota && tempiPilota[psNextIndex] && psNextIndex === ultimaPs + 1;
     });
     
-    pilotiPerPS[psMain] = [];
-    const pilotiDaRilasciareMain = pilotiDisponibiliMain.slice(0, tempiPerMain);
+    pilotiPerPS[psNext] = [];
+    const pilotiDaRilasciareNext = pilotiDisponibiliNext.slice(0, tempiRimanenti);
     
-    for (const numGara of pilotiDaRilasciareMain) {
+    for (const numGara of pilotiDaRilasciareNext) {
       const tempiPilota = statoSimulazione.tempiPerPilota[numGara];
-      const tempo = tempiPilota[psMainIndex];
+      const tempo = tempiPilota[psNextIndex];
       
       if (tempo) {
         batch.push(tempo);
-        pilotiPerPS[psMain].push(numGara);
-        statoSimulazione.psRilasciatePerPilota[numGara] = psMainIndex;
-        statoSimulazione.tempiRilasciatiPerPS[psMain]++;
+        pilotiPerPS[psNext].push(numGara);
+        statoSimulazione.psRilasciatePerPilota[numGara] = psNextIndex;
+        statoSimulazione.tempiRilasciatiPerPS[psNext]++;
         statoSimulazione.tempiRilasciati++;
         tempiRimanenti--;
       }
     }
-    
-    // Se può sovrapporre, rilascia anche per PS successiva
-    if (puoSovrapporre && tempiRimanenti > 0) {
-      const psNext = psOrdinate[psMainIndex + 1];
-      const psNextIndex = psMainIndex + 1;
-      
-      const pilotiDisponibiliNext = statoSimulazione.pilotiOrdine.filter(numGara => {
-        const tempiPilota = statoSimulazione.tempiPerPilota[numGara];
-        const ultimaPs = statoSimulazione.psRilasciatePerPilota[numGara];
-        return tempiPilota && tempiPilota[psNextIndex] && psNextIndex === ultimaPs + 1;
-      });
-      
-      pilotiPerPS[psNext] = [];
-      const pilotiDaRilasciareNext = pilotiDisponibiliNext.slice(0, tempiRimanenti);
-      
-      for (const numGara of pilotiDaRilasciareNext) {
-        const tempiPilota = statoSimulazione.tempiPerPilota[numGara];
-        const tempo = tempiPilota[psNextIndex];
-        
-        if (tempo) {
-          batch.push(tempo);
-          pilotiPerPS[psNext].push(numGara);
-          statoSimulazione.psRilasciatePerPilota[numGara] = psNextIndex;
-          statoSimulazione.tempiRilasciatiPerPS[psNext]++;
-          statoSimulazione.tempiRilasciati++;
-          tempiRimanenti--;
-        }
-      }
-    }
   }
   
-  // Log dettagliato
+  // Log
   const dettaglio = Object.entries(pilotiPerPS)
     .filter(([_, piloti]) => piloti.length > 0)
-    .map(([ps, piloti]) => `PS${ps}: ${piloti.slice(0, 5).join(',')}${piloti.length > 5 ? '...' : ''} (${piloti.length})`)
+    .map(([ps, piloti]) => `PS${ps}:${piloti.length}`)
     .join(' | ');
   
   const progresso = Math.round((statoSimulazione.tempiRilasciati / statoSimulazione.tempiTotali) * 100);
-  
-  // Mostra PS attive
-  const psAttiveLog = [];
-  psOrdinate.forEach(ps => {
-    const perc = Math.round((statoSimulazione.tempiRilasciatiPerPS[ps] || 0) / (statoSimulazione.tempiTotaliPerPS[ps] || 1) * 100);
-    if (perc > 0 && perc < 100) {
-      psAttiveLog.push(`PS${ps}:${perc}%`);
-    }
-  });
-  
   aggiungiLog('📤', 'BATCH', `${batch.length} tempi (${progresso}%)`, dettaglio);
-  if (psAttiveLog.length > 0) {
-    aggiungiLog('🔴', 'LIVE', psAttiveLog.join(', '));
-  }
   
   return {
     completato: false,
@@ -391,38 +395,24 @@ function rilasciaBatch() {
 // ============================================
 
 async function salvaTempiDB(tempi) {
-  if (!tempi || tempi.length === 0) return { salvati: 0, errori: 0 };
+  if (!tempi || tempi.length === 0) return { salvati: 0 };
   
   let salvati = 0;
-  let errori = 0;
   
   for (const tempo of tempi) {
     try {
-      const exists = await pool.query(
-        'SELECT id FROM tempi WHERE id_pilota = $1 AND id_ps = $2',
-        [tempo.id_pilota, tempo.id_ps]
-      );
-      
-      if (exists.rows.length === 0) {
-        await pool.query(`
-          INSERT INTO tempi (id_pilota, id_ps, tempo_secondi, penalita_secondi)
-          VALUES ($1, $2, $3, $4)
-        `, [tempo.id_pilota, tempo.id_ps, tempo.tempo_secondi, tempo.penalita_secondi || 0]);
-        salvati++;
-      } else {
-        salvati++;
-      }
+      await pool.query(`
+        INSERT INTO tempi (id_pilota, id_ps, tempo_secondi, penalita_secondi)
+        VALUES ($1, $2, $3, $4)
+        ON CONFLICT (id_pilota, id_ps) DO UPDATE SET tempo_secondi = $3, penalita_secondi = $4
+      `, [tempo.id_pilota, tempo.id_ps, tempo.tempo_secondi, tempo.penalita_secondi || 0]);
+      salvati++;
     } catch (err) {
-      console.error(`Errore salvataggio tempo:`, err.message);
-      errori++;
+      // Ignora errori di duplicati
     }
   }
   
-  if (salvati > 0) {
-    aggiungiLog('💾', 'DB', `Salvati ${salvati} tempi nel database`);
-  }
-  
-  return { salvati, errori };
+  return { salvati };
 }
 
 // ============================================
@@ -437,10 +427,7 @@ app.post('/simulator/init', async (req, res) => {
   }
   
   const result = await inizializzaSimulazione(evento_id, {
-    durata_minuti,
-    batch_min,
-    batch_max,
-    sovrapposizione
+    durata_minuti, batch_min, batch_max, sovrapposizione
   });
   
   res.json(result);
@@ -452,12 +439,17 @@ app.post('/simulator/start', async (req, res) => {
   }
   
   if (statoSimulazione.inEsecuzione && !statoSimulazione.inPausa) {
-    return res.json({ success: true, message: 'Simulazione già in esecuzione' });
+    return res.json({ success: true, message: 'Già in esecuzione' });
   }
+  
+  // CANCELLA TEMPI DAL DB PRIMA DI INIZIARE
+  aggiungiLog('🗑️', 'PULIZIA', 'Cancellazione tempi dal database...');
+  const risultatoCancellazione = await cancellaTempiEvento(statoSimulazione.eventoId);
+  aggiungiLog('✅', 'PULIZIA', `Cancellati ${risultatoCancellazione.cancellati} tempi`);
   
   statoSimulazione.inEsecuzione = true;
   statoSimulazione.inPausa = false;
-  statoSimulazione.oraInizio = statoSimulazione.oraInizio || new Date();
+  statoSimulazione.oraInizio = new Date();
   
   if (!statoSimulazione.timerRef) {
     statoSimulazione.timerRef = setInterval(async () => {
@@ -481,22 +473,13 @@ app.post('/simulator/start', async (req, res) => {
 
 app.post('/simulator/pause', (req, res) => {
   if (!statoSimulazione.inEsecuzione) {
-    return res.status(400).json({ success: false, error: 'Simulazione non in esecuzione' });
+    return res.status(400).json({ success: false, error: 'Non in esecuzione' });
   }
   
   statoSimulazione.inPausa = !statoSimulazione.inPausa;
+  aggiungiLog(statoSimulazione.inPausa ? '⏸️' : '▶️', statoSimulazione.inPausa ? 'PAUSA' : 'RIPRESO', '');
   
-  if (statoSimulazione.inPausa) {
-    aggiungiLog('⏸️', 'PAUSA', 'Simulazione in pausa');
-  } else {
-    aggiungiLog('▶️', 'RIPRESO', 'Simulazione ripresa');
-  }
-  
-  res.json({
-    success: true,
-    inPausa: statoSimulazione.inPausa,
-    message: statoSimulazione.inPausa ? 'In pausa' : 'Ripresa'
-  });
+  res.json({ success: true, inPausa: statoSimulazione.inPausa });
 });
 
 app.post('/simulator/stop', (req, res) => {
@@ -507,15 +490,9 @@ app.post('/simulator/stop', (req, res) => {
   
   statoSimulazione.inEsecuzione = false;
   statoSimulazione.inPausa = false;
-  
   aggiungiLog('⏹️', 'STOP', 'Simulazione fermata');
   
-  res.json({
-    success: true,
-    message: 'Simulazione fermata',
-    tempiRilasciati: statoSimulazione.tempiRilasciati,
-    tempiTotali: statoSimulazione.tempiTotali
-  });
+  res.json({ success: true, tempiRilasciati: statoSimulazione.tempiRilasciati });
 });
 
 app.post('/simulator/reset', async (req, res) => {
@@ -537,10 +514,7 @@ app.post('/simulator/reset', async (req, res) => {
 
 app.get('/simulator/status', (req, res) => {
   if (!statoSimulazione.inizializzato) {
-    return res.json({ 
-      inizializzato: false, 
-      message: 'Chiamare POST /simulator/init con evento_id' 
-    });
+    return res.json({ inizializzato: false });
   }
   
   const progresso = Math.round((statoSimulazione.tempiRilasciati / statoSimulazione.tempiTotali) * 100);
@@ -580,7 +554,7 @@ app.get('/health', (req, res) => {
   res.json({ 
     status: 'OK', 
     service: 'ficr-simulator',
-    version: '2.1.0',
+    version: '2.2.0',
     timestamp: new Date().toISOString() 
   });
 });
@@ -588,22 +562,13 @@ app.get('/health', (req, res) => {
 app.get('/', (req, res) => {
   res.json({
     name: 'FICR Simulator',
-    version: '2.1.0',
-    description: 'Fix sovrapposizione realistica - max 2 PS attive',
-    endpoints: {
-      'POST /simulator/init': 'Inizializza con evento_id e parametri',
-      'POST /simulator/start': 'Avvia rilascio automatico',
-      'POST /simulator/pause': 'Pausa/Riprendi',
-      'POST /simulator/stop': 'Ferma simulazione',
-      'POST /simulator/reset': 'Reset simulazione',
-      'GET /simulator/status': 'Stato dettagliato',
-      'GET /simulator/log': 'Log eventi'
-    }
+    version: '2.2.0',
+    description: 'Reset cancella tempi dal DB + sovrapposizione corretta'
   });
 });
 
 // ============================================
-// AVVIO SERVER
+// AVVIO
 // ============================================
 
 async function avviaServer() {
@@ -611,14 +576,14 @@ async function avviaServer() {
     await pool.query('SELECT NOW()');
     console.log('✅ Connessione DB OK');
   } catch (err) {
-    console.error('❌ Errore connessione DB:', err.message);
+    console.error('❌ Errore DB:', err.message);
     process.exit(1);
   }
   
   app.listen(config.PORT, () => {
-    console.log(`\n🚀 Simulatore FICR v2.1 avviato su porta ${config.PORT}`);
-    console.log(`   http://localhost:${config.PORT}`);
-    console.log(`\n📋 Fix: Max 2 PS attive contemporaneamente\n`);
+    console.log(`\n🚀 Simulatore FICR v2.2 su porta ${config.PORT}`);
+    console.log(`   - Reset cancella tempi dal DB`);
+    console.log(`   - Max 2 PS attive\n`);
   });
 }
 
